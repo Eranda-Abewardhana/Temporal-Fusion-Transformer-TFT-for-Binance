@@ -1,4 +1,14 @@
 # --- Imports ---
+# Save original torch.load
+import torch
+
+original_torch_load = torch.load
+def patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False  # Ensure weights_only is False
+    return original_torch_load(*args, **kwargs)
+
+torch.load = patched_torch_load
+
 def fine_tune_and_plot_forecast():
     import os
     import joblib
@@ -74,7 +84,7 @@ def fine_tune_and_plot_forecast():
     fine_tune_loader = fine_tune_dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
 
     # --- Load and fine-tune model ---
-    model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH, map_location="cpu")
+    model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH)
     model.train()
 
     trainer = Trainer(
@@ -336,3 +346,7 @@ def fine_tune_and_plot_forecast():
     )
 
     fig.show()
+# if __name__ == "__main__":
+#     import multiprocessing
+#     multiprocessing.freeze_support()  # Optional but helpful on Windows
+#     fine_tune_and_plot_forecast()

@@ -1,63 +1,57 @@
 import os
-import pickle
-import numpy as np
 import pandas as pd
+import numpy as np
 import joblib
-import pytorch_lightning
 import torch
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer, EncoderNormalizer
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import io
+import torch
+from pytorch_forecasting.data.encoders import EncoderNormalizer, NaNLabelEncoder
+import numpy
+from sklearn.preprocessing import StandardScaler
 
-# Patch for StrDType in NumPy >=1.26 check
-_real_find_class = pickle.Unpickler.find_class
-import builtins
+# Dynamically fetch NumPy's internal scalar and dtype classes
+scalar = getattr(__import__("numpy.core.multiarray", fromlist=["scalar"]), "scalar")
+_reconstruct = getattr(__import__("numpy.core.multiarray", fromlist=["_reconstruct"]), "_reconstruct")
+dtype = np.dtype
+float32_dtype_class = np.dtype("float32").__class__  # Fixes Float32DType issue
+int32_dtype_class = np.dtype("int32").__class__
+ndarray = getattr(__import__("numpy", fromlist=["ndarray"]), "ndarray")
 
-def patched_torch_load(path, map_location="cpu"):
-    import pickle
-    original_find_class = pickle.Unpickler.find_class
+# Register all required classes
+torch.serialization.add_safe_globals([
+    EncoderNormalizer,
+    StandardScaler,
+    np.generic,
+    np.float32,
+    np.float64,
+    np.int64,
+    np.int32,
+    scalar,
+    dtype,
+    float32_dtype_class,
+    int32_dtype_class,
+    NaNLabelEncoder,
+    _reconstruct,
+    ndarray,
+    np.dtype("str"),       # 👈 key fix: needed to allow np.str_ and np.dtypes.StrDType
+    np.str_,
+])
+# Save original torch.load
+original_torch_load = torch.load
 
-    def fixed_find_class(self, module, name):
-        if name == "StrDType":
-            return lambda *args, **kwargs: np.dtype("str_")
-        return original_find_class(self, module, name)
+# Patch torch.load to force weights_only=False
+def patched_torch_load(*args, **kwargs):
+    if "weights_only" in kwargs:
+        kwargs["weights_only"] = False
+    else:
+        kwargs.update({"weights_only": False})
+    return original_torch_load(*args, **kwargs)
 
-    # Patch
-    pickle.Unpickler.find_class = fixed_find_class
-
-    try:
-        return torch.load(path, map_location=map_location)
-    finally:
-        # Restore
-        pickle.Unpickler.find_class = original_find_class
-
-class FixedStrDTypeUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        if name == "StrDType":
-            return lambda *args, **kwargs: np.dtype("str_")
-        return super().find_class(module, name)
-
-def safe_torch_load(path, map_location="cpu"):
-    with open(path, "rb") as f:
-        return FixedStrDTypeUnpickler(io.BytesIO(f.read())).load()
-class PatchedUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        if name == "StrDType":
-            return lambda *args, **kwargs: np.dtype("str_")
-        return super().find_class(module, name)
-
-def patched_find_class(self, module, name):
-    if name == "StrDType":
-        return lambda *args, **kwargs: np.dtype("str_")
-    return _real_find_class(self, module, name)
-
+torch.load = patched_torch_load
 def predict_tfts():
-    print("NumPy:", np.__version__)
-    print("Torch:", torch.__version__)
-    print("PyTorch Lightning:", pytorch_lightning.__version__)
-
     # --- Paths ---
     DATA_DIR = "Preprocess Data/Preprocess_csvs"
     ARTIFACT_DIR = "Model_Training/Model Artifacts"
@@ -70,7 +64,10 @@ def predict_tfts():
     df_val = pd.read_csv(os.path.join(DATA_DIR, "val.csv"), parse_dates=["datetime"])
     df_test = pd.read_csv(os.path.join(DATA_DIR, "test.csv"), parse_dates=["datetime"])
 
+    # --- Combine datasets ---
     df_all = pd.concat([df_train, df_val, df_test], ignore_index=True)
+
+    # --- Feature engineering ---
     df_all.sort_values("datetime", inplace=True)
     df_all["group_id"] = "BTC"
     df_all["time_idx"] = (df_all["datetime"] - df_all["datetime"].min()).dt.total_seconds() // 3600
@@ -83,10 +80,12 @@ def predict_tfts():
     df_all["dow_cos"] = np.cos(2 * np.pi * df_all["day_of_week"] / 7)
     df_all["static_id"] = "btc"
 
+    # --- Load and apply scaler ---
     with open(SCALER_PATH, 'rb') as f:
         scaler = joblib.load(f)
     df_all["price_scaled"] = scaler.transform(df_all[["price"]])
 
+    # --- Add lag, rolling, and momentum features ---
     lag_features = [1, 6, 12, 24, 48, 168]
     for lag in lag_features:
         df_all[f"lag_{lag}"] = df_all["price_scaled"].shift(lag)
@@ -96,6 +95,7 @@ def predict_tfts():
     df_all["momentum_24"] = df_all["price_scaled"] - df_all["lag_24"]
     df_all.bfill(inplace=True)
 
+    # --- Dataset config ---
     max_encoder_length = 336
     max_prediction_length = 24
 
@@ -119,86 +119,44 @@ def predict_tfts():
 
     full_loader = full_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
 
-    # --- Patch pickle temporarily during model load ---
-    # --- Load checkpoint using patched unpickler ---
-    # --- Helper to safely load checkpoints with NumPy >= 1.26 ---
-    class NumpyStrDTypeFixLoader:
-        def __init__(self, file_obj):
-            self.file_obj = file_obj
-
-        def read(self, *args, **kwargs):
-            return self.file_obj.read(*args, **kwargs)
-
-        def readline(self, *args, **kwargs):
-            return self.file_obj.readline(*args, **kwargs)
-
-        def seek(self, *args, **kwargs):
-            return self.file_obj.seek(*args, **kwargs)
-
-        def __enter__(self):
-            import pickle
-            self._original = pickle.Unpickler
-            loader = self
-
-            class FixedUnpickler(pickle.Unpickler):
-                def find_class(self, module, name):
-                    if name == "StrDType":
-                        return lambda *args, **kwargs: np.dtype("str_")
-                    return super().find_class(module, name)
-
-            pickle.Unpickler = FixedUnpickler
-            return loader
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            import pickle
-            pickle.Unpickler = self._original
-
-    # --- Use the safe loader context to load your checkpoint ---
-    # --- Use the safe loader context to load your checkpoint ---
-    with open(MODEL_PATH, "rb") as f:
-        import pickle
-
-        class FixedUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                if name == "StrDType":
-                    return lambda *args, **kwargs: np.dtype("str_")
-                return super().find_class(module, name)
-
-        # Patch Unpickler just for this one call
-        original_unpickler = pickle._Unpickler if hasattr(pickle, '_Unpickler') else pickle.Unpickler
-        pickle.Unpickler = FixedUnpickler
-        checkpoint = patched_torch_load(MODEL_PATH, map_location="cpu")
-
-        pickle.Unpickler = original_unpickler
-
-    model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH, checkpoint=checkpoint)
+    # --- Load model ---
+    model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH)
 
     # --- Predict ---
     pred_output = model.predict(full_loader, mode="raw", return_x=True)
     raw_predictions = pred_output.output
     x = pred_output.x
 
+    # --- Extract predictions ---
     all_forecasts = []
     for i in range(len(raw_predictions["prediction"])):
         decoder_time_idx = x["decoder_time_idx"][i].detach().cpu().numpy()
         decoder_dates = df_all[df_all["time_idx"].isin(decoder_time_idx)]["datetime"].values
+
         pred_scaled = raw_predictions["prediction"][i, :, 3].unsqueeze(-1).detach().numpy()
         pred_actual = scaler.inverse_transform(pred_scaled).flatten()
+
         min_len = min(len(decoder_dates), len(pred_actual))
         all_forecasts.append(pd.DataFrame({
             "datetime": decoder_dates[:min_len],
             "predicted_price": pred_actual[:min_len]
         }))
 
-    all_predictions_df = pd.concat(all_forecasts, ignore_index=True).drop_duplicates(subset="datetime")
+    # --- Combine forecasts ---
+    all_predictions_df = pd.concat(all_forecasts, ignore_index=True)
+    all_predictions_df = all_predictions_df.drop_duplicates(subset="datetime")
+
+    # --- Save TFT predictions (for residual model) ---
     tft_save_df = all_predictions_df.copy()
     tft_save_df.rename(columns={"predicted_price": "tft_pred"}, inplace=True)
     tft_save_df.to_csv(TFT_PRED_PATH, index=False)
     print(f"📁 Saved TFT predictions to: {TFT_PRED_PATH}")
 
+    # --- Merge with actuals ---
     actuals_df = df_all[["datetime", "price"]].drop_duplicates()
     merged = pd.merge(actuals_df, all_predictions_df, on="datetime", how="inner")
 
+    # --- Accuracy Metrics ---
     mae = mean_absolute_error(merged["price"], merged["predicted_price"])
     mse = mean_squared_error(merged["price"], merged["predicted_price"])
     rmse = np.sqrt(mse)
@@ -210,16 +168,21 @@ def predict_tfts():
     print(f"✅ RMSE : {rmse:.4f}")
     print(f"✅ MAPE : {mape:.2f}%")
 
+    # --- Residuals ---
     merged["residual"] = merged["price"] - merged["predicted_price"]
+
+    # --- Split train/test predictions ---
     test_start = df_test["datetime"].min()
     train_pred = merged[merged["datetime"] < test_start]
     test_pred = merged[merged["datetime"] >= test_start]
 
+    # --- Plot: Forecast + Residual ---
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
         row_heights=[0.8, 0.2], subplot_titles=["Bitcoin Price Forecast", "Prediction Residuals"]
     )
 
+    # Forecast plot
     fig.add_trace(go.Scatter(x=train_pred["datetime"], y=train_pred["predicted_price"],
                              name="Predicted (Train)", line=dict(color="orange")), row=1, col=1)
     fig.add_trace(go.Scatter(x=test_pred["datetime"], y=test_pred["predicted_price"],
@@ -227,9 +190,11 @@ def predict_tfts():
     fig.add_trace(go.Scatter(x=merged["datetime"], y=merged["price"],
                              name="Actual Price", line=dict(color="blue")), row=1, col=1)
 
+    # Residuals plot
     fig.add_trace(go.Scatter(x=merged["datetime"], y=merged["residual"],
                              name="Residuals", line=dict(color="gray")), row=2, col=1)
 
+    # Highlight test region
     fig.add_vrect(
         x0=test_start, x1=df_test["datetime"].max(),
         fillcolor="lightblue", opacity=0.3,
@@ -247,3 +212,8 @@ def predict_tfts():
     )
 
     fig.show()
+
+# if __name__ == "__main__":
+#     import multiprocessing
+#     multiprocessing.freeze_support()  # Optional but helpful on Windows
+#     predict_tfts()
